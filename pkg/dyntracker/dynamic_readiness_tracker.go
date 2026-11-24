@@ -17,6 +17,7 @@ import (
 	watchtools "k8s.io/client-go/tools/watch"
 
 	"github.com/werf/kubedog/pkg/dyntracker/logstore"
+	"github.com/werf/kubedog/pkg/dyntracker/redaction"
 	"github.com/werf/kubedog/pkg/dyntracker/statestore"
 	"github.com/werf/kubedog/pkg/dyntracker/util"
 	"github.com/werf/kubedog/pkg/informer"
@@ -53,7 +54,22 @@ type DynamicReadinessTracker struct {
 	ignoreLogsForContainers        []string
 	ignoreLogsByRegex              *regexp.Regexp
 	ignoreLogsByRegexForContainers map[string]*regexp.Regexp
-	saveEvents                     bool
+	redactLogsConfig               *redaction.Config
+	// redactLogsEngines holds one stateful redaction source per container so
+	// multiline window state is never shared between sources. The map itself
+	// is only touched from the Track loop goroutine.
+	redactLogsEngines map[string]*logRedactor
+	saveEvents        bool
+}
+
+// logRedactor pairs a redaction Engine with a timestamp queue that stays 1:1
+// aligned with the engine's window: entry i is the original Timestamp of the
+// i-th line the engine currently holds. This lets window evictions and stream
+// end flushes keep every emitted line's real timestamp instead of borrowing
+// the timestamp of a newer line.
+type logRedactor struct {
+	engine     *redaction.Engine
+	timestamps []string
 }
 
 func NewDynamicReadinessTracker(
@@ -186,6 +202,8 @@ func NewDynamicReadinessTracker(
 		ignoreLogsByRegexForContainers: opts.IgnoreLogsByRegexForContainers,
 		ignoreLogs:                     opts.IgnoreLogs,
 		ignoreLogsForContainers:        opts.IgnoreLogsForContainers,
+		redactLogsConfig:               opts.RedactLogs,
+		redactLogsEngines:              make(map[string]*logRedactor),
 		saveEvents:                     opts.SaveEvents,
 	}, nil
 }
@@ -204,7 +222,12 @@ type DynamicReadinessTrackerOptions struct {
 	IgnoreLogsForContainers                  []string
 	IgnoreLogsByRegex                        *regexp.Regexp
 	IgnoreLogsByRegexForContainers           map[string]*regexp.Regexp
-	SaveEvents                               bool
+	// RedactLogs, when non-nil and non-empty of rules, masks configured
+	// patterns in log message bodies after the save/ignore filters selected
+	// the lines, but before anything is written to the log store. A nil
+	// value keeps the historical, unredacted behavior unchanged.
+	RedactLogs *redaction.Config
+	SaveEvents bool
 }
 
 func (t *DynamicReadinessTracker) Track(ctx context.Context) error {
@@ -1422,6 +1445,15 @@ func (t *DynamicReadinessTracker) handlePodLogChunk(logChunk *pod.PodLogChunk, l
 		return
 	}
 
+	// Filtering ran on the original message bodies above, so save/ignore
+	// selection keeps its historical semantics. Redaction happens only now,
+	// after selection and before anything reaches the log store or a display
+	// consumer: no unredacted value is ever persisted by this tracker.
+	logLines = t.redactLogLines(logChunk.PodName, logChunk.ContainerName, logLines)
+	if len(logLines) == 0 {
+		return
+	}
+
 	namespace := taskState.Namespace()
 
 	var resourceLogs *util.Concurrent[*logstore.ResourceLogs]
@@ -1446,6 +1478,194 @@ func (t *DynamicReadinessTracker) handlePodLogChunk(logChunk *pod.PodLogChunk, l
 			rl.AddLogLine(line.Message, "container/"+logChunk.ContainerName, lo.Must(time.Parse(time.RFC3339, line.Timestamp)))
 		})
 	}
+}
+
+// redactLogLines applies the configured redaction rules to the message bodies
+// of logLines, preserving order and leaving Timestamp untouched. With no
+// configuration it returns the input unchanged (same slice, same strings), so
+// the disabled feature is byte-identical to the previous behavior.
+//
+// Each (pod, container) source gets its own redactor: residual multiline
+// window content of one source can never influence another source. The output
+// contains at least as many lines as the input over the stream's lifetime
+// (redaction replaces values, it never deletes a line); a single call may
+// return additional lines when the bounded window releases previously held
+// content together with the current lines.
+func (t *DynamicReadinessTracker) redactLogLines(podName, containerName string, logLines []log.LogLine) []log.LogLine {
+	if t.redactLogsConfig == nil || len(logLines) == 0 {
+		return logLines
+	}
+
+	key := podName + "\x00" + containerName
+	r, ok := t.redactLogsEngines[key]
+	if !ok {
+		r = &logRedactor{engine: redaction.NewEngine(t.redactLogsConfig)}
+		t.redactLogsEngines[key] = r
+	}
+	if !r.engine.Enabled() {
+		return logLines
+	}
+
+	out := make([]log.LogLine, 0, len(logLines))
+	for _, line := range logLines {
+		// Timestamps stay outside the redaction domain: rules only see the
+		// message body.
+		result := r.engine.ProcessLine(line.Message)
+		emitted := result.Emitted
+		evicted := result.Evicted
+
+		// Eviction always pops the oldest head lines; save their original
+		// timestamps first, then emit evicted lines before the current line
+		// so stream order never changes.
+		evictedTimestamps := make([]string, 0, evicted)
+		for i := 0; i < evicted && len(r.timestamps) > 0; i++ {
+			evictedTimestamps = append(evictedTimestamps, r.timestamps[0])
+			r.timestamps = r.timestamps[1:]
+		}
+
+		for i := 0; i < evicted && i < len(emitted); i++ {
+			ts := ""
+			if i < len(evictedTimestamps) {
+				ts = evictedTimestamps[i]
+			}
+			out = append(out, log.LogLine{Timestamp: ts, Message: emitted[i]})
+		}
+
+		// The fed line is itself the last emission when it was not buffered.
+		if evicted < len(emitted) {
+			out = append(out, log.LogLine{Timestamp: line.Timestamp, Message: emitted[len(emitted)-1]})
+		}
+
+		// Keep the timestamp queue 1:1 aligned with the engine window.
+		heldAfter := r.engine.WindowSize()
+		if evicted == len(emitted) {
+			for len(r.timestamps) < heldAfter {
+				r.timestamps = append(r.timestamps, line.Timestamp)
+			}
+		}
+		for len(r.timestamps) > heldAfter {
+			r.timestamps = r.timestamps[:len(r.timestamps)-1]
+		}
+	}
+
+	return out
+}
+
+// flushRedaction releases every line still held in a source's bounded
+// multiline window at stream end, each with its original timestamp. It never
+// blocks waiting for a multiline end marker that may never arrive.
+func (t *DynamicReadinessTracker) flushRedaction(podName, containerName string) []log.LogLine {
+	if t.redactLogsConfig == nil {
+		return nil
+	}
+
+	key := podName + "\x00" + containerName
+	r, ok := t.redactLogsEngines[key]
+	if !ok || !r.engine.Enabled() {
+		return nil
+	}
+
+	messages := r.engine.Flush()
+	if len(messages) == 0 {
+		r.timestamps = r.timestamps[:0]
+		return nil
+	}
+
+	lines := make([]log.LogLine, 0, len(messages))
+	for i, message := range messages {
+		ts := ""
+		if i < len(r.timestamps) {
+			ts = r.timestamps[i]
+		}
+		lines = append(lines, log.LogLine{Timestamp: ts, Message: message})
+	}
+	r.timestamps = r.timestamps[:0]
+
+	return lines
+}
+
+// resetRedaction discards all redaction window state for a source. Use it on
+// container switches / stream teardown so no residual bytes survive the
+// source identity change.
+func (t *DynamicReadinessTracker) resetRedaction(podName, containerName string) {
+	if t.redactLogsConfig == nil {
+		return
+	}
+
+	key := podName + "\x00" + containerName
+	delete(t.redactLogsEngines, key)
+}
+
+// FlushLogRedaction releases every line still held in the bounded multiline
+// window of one (pod, container) source and stores it through the regular log
+// path, preserving order, source identifier and the original timestamps.
+//
+// It is meant to be called when the caller knows the container stream ended
+// (for example after a log relay goroutine observed EOF). Calling it is never
+// required for correctness of masking: the window bounds guarantee buffered
+// content is released on its own, it only controls promptness at stream end.
+// It is safe to call for unknown or unconfigured sources (returns without
+// changes) and may be called repeatedly.
+func (t *DynamicReadinessTracker) FlushLogRedaction(podName, containerName string) {
+	if t.redactLogsConfig == nil {
+		return
+	}
+
+	lines := t.flushRedaction(podName, containerName)
+	if len(lines) == 0 {
+		return
+	}
+
+	t.logStore.RWTransaction(func(ls *logstore.LogStore) {
+		var resourceLogs *util.Concurrent[*logstore.ResourceLogs]
+		namespace := t.taskStateObject().Namespace()
+
+		if found, ok := lo.Find(ls.ResourcesLogs(), func(crl *util.Concurrent[*logstore.ResourceLogs]) bool {
+			var found bool
+			crl.RTransaction(func(rl *logstore.ResourceLogs) {
+				found = rl.Name() == podName && rl.Namespace() == namespace && rl.GroupVersionKind() == podGvk
+			})
+			return found
+		}); ok {
+			resourceLogs = found
+		} else {
+			resourceLogs = util.NewConcurrent(logstore.NewResourceLogs(podName, namespace, podGvk))
+			ls.AddResourceLogs(resourceLogs)
+		}
+
+		source := "container/" + containerName
+		for _, line := range lines {
+			// The timestamp queue is kept 1:1 with the engine window, so a
+			// flushed line always carries its original RFC3339 timestamp. A
+			// parse failure here would indicate an internal bookkeeping bug;
+			// fall back to the current time rather than dropping the line or
+			// inventing a malformed timestamp.
+			ts, err := time.Parse(time.RFC3339, line.Timestamp)
+			if err != nil {
+				ts = time.Now()
+			}
+			resourceLogs.RWTransaction(func(rl *logstore.ResourceLogs) {
+				rl.AddLogLine(line.Message, source, ts)
+			})
+		}
+	})
+}
+
+// ResetLogRedaction drops all redaction state for one source. Call it when a
+// container stream is torn down or its identity changes; afterwards a fresh
+// stream of the same source starts with an empty window.
+func (t *DynamicReadinessTracker) ResetLogRedaction(podName, containerName string) {
+	t.resetRedaction(podName, containerName)
+}
+
+// taskStateObject safely reads the current task state for namespace lookups
+// outside the main Track loop.
+func (t *DynamicReadinessTracker) taskStateObject() *statestore.ReadinessTaskState {
+	var ts *statestore.ReadinessTaskState
+	t.taskState.RTransaction(func(state *statestore.ReadinessTaskState) {
+		ts = state
+	})
+	return ts
 }
 
 func (t *DynamicReadinessTracker) handleEventMessage(msg string, taskState *statestore.ReadinessTaskState, timestamp time.Time) {

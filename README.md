@@ -6,6 +6,13 @@ Kubedog is a library to watch for Kubernetes resources readiness, presence or ab
 
 This library is used in [werf](https://github.com/werf/werf) and [Nelm](https://github.com/werf/nelm) to track resources during deployments.
 
+## Container log redaction
+
+Collected container logs can be masked with explicitly configured rules before
+they are stored or displayed. See [docs/log-redaction.md](docs/log-redaction.md)
+for the supported patterns, bounded multiline window, defaults and detection
+boundaries.
+
 ## Community
 
 Please feel free to reach us via [project's Discussions](https://github.com/werf/kubedog/discussions) and [werf's Telegram group](https://t.me/werf_io) (there's [another one in Russian](https://t.me/werf_ru) as well).
